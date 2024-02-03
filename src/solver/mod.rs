@@ -9,9 +9,10 @@ use crate::{
     solvable::SolvableInner,
     Dependencies, DependencyProvider, PackageName, VersionSet, VersionSetId,
 };
+use futures::StreamExt;
 use std::any::Any;
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::fmt::Display;
 use std::ops::ControlFlow;
 use std::rc::Rc;
@@ -56,8 +57,8 @@ pub struct Solver<VS: VersionSet, N: PackageName, D: DependencyProvider<VS, N>> 
     learnt_why: Mapping<LearntClauseId, Vec<ClauseId>>,
     learnt_clause_ids: Vec<ClauseId>,
 
-    clauses_added_for_package: RefCell<HashMap<NameId, Rc<tokio::sync::Mutex<bool>>>>,
-    clauses_added_for_solvable: RefCell<HashMap<SolvableId, Rc<tokio::sync::Mutex<bool>>>>,
+    clauses_added_for_package: RefCell<HashSet<NameId>>,
+    clauses_added_for_solvable: RefCell<HashSet<SolvableId>>,
 
     decision_tracker: DecisionTracker,
 
@@ -189,177 +190,252 @@ impl<VS: VersionSet, N: PackageName + Display, D: DependencyProvider<VS, N>> Sol
         solvable_id: SolvableId,
     ) -> Result<AddClauseOutput, Box<dyn Any>> {
         let output = RefCell::new(AddClauseOutput::default());
-        let queue = RefCell::new(vec![solvable_id]);
         let seen = RefCell::new(HashSet::new());
         seen.borrow_mut().insert(solvable_id);
 
-        // while let Some(solvable_id) = queue.borrow_mut().pop() {
-        loop {
-            let Some(solvable_id) = queue.borrow_mut().pop() else {
-                break;
-            };
+        let cancel_requested = RefCell::new(None);
+        let (solvable_queue_tx, mut solvable_queue_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (add_requirements_tx, add_requirements_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (add_constrains_tx, add_constrains_rx) = tokio::sync::mpsc::unbounded_channel();
+        solvable_queue_tx.send(solvable_id).unwrap();
 
+        {
             let output = &output;
-            let queue = &queue;
-            let seen = &seen;
+            let cancel_requested = &cancel_requested;
 
-            let mutex = {
-                let mut clauses = self.clauses_added_for_solvable.borrow_mut();
-                let mutex = clauses
-                    .entry(solvable_id)
-                    .or_insert_with(|| Rc::new(tokio::sync::Mutex::new(false)));
-                mutex.clone()
-            };
-
-            // This prevents concurrent requests to add clauses for a solvable from racing. Only the
-            // first request for that solvable will go through, and others will wait till it
-            // completes.
-            let mut clauses_added = mutex.lock().await;
-            if *clauses_added {
-                continue;
-            }
-
-            let solvable = self.pool.resolve_internal_solvable(solvable_id);
-            tracing::trace!(
-                "┝━ adding clauses for dependencies of {}",
-                solvable.display(&self.pool)
-            );
-
-            // Determine the dependencies of the current solvable. There are two cases here:
-            // 1. The solvable is the root solvable which only provides required dependencies.
-            // 2. The solvable is a package candidate in which case we request the corresponding
-            //    dependencies from the `DependencyProvider`.
-            let (requirements, constrains) = match solvable.inner {
-                SolvableInner::Root => (self.root_requirements.clone(), Vec::new()),
-                SolvableInner::Package(_) => {
-                    let deps = self.cache.get_or_cache_dependencies(solvable_id).await?;
-                    match deps {
-                        Dependencies::Known(deps) => {
-                            (deps.requirements.clone(), deps.constrains.clone())
-                        }
-                        Dependencies::Unknown(reason) => {
-                            // There is no information about the solvable's dependencies, so we add
-                            // an exclusion clause for it
-                            let clause_id = self
-                                .clauses
-                                .borrow_mut()
-                                .alloc(ClauseState::exclude(solvable_id, *reason));
-
-                            // Exclusions are negative assertions, tracked outside of the watcher system
-                            let mut output = output.borrow_mut();
-                            output.negative_assertions.push((solvable_id, clause_id));
-
-                            // There might be a conflict now
-                            if self.decision_tracker.assigned_value(solvable_id) == Some(true) {
-                                output.conflicting_clauses.push(clause_id);
-                            }
-
-                            continue;
-                        }
+            let process_queue = async move {
+                while let Some(solvable_id) = solvable_queue_rx.recv().await {
+                    println!("Processing solvable...");
+                    let newly_inserted = self
+                        .clauses_added_for_solvable
+                        .borrow_mut()
+                        .insert(solvable_id);
+                    if !newly_inserted {
+                        // The solvable has already been, or is being processed
+                        continue;
                     }
-                }
-            };
 
-            // Add clauses for the requirements
-            let add_requirements = requirements.into_iter().map(|version_set_id| async move {
-                let dependency_name = self.pool.resolve_version_set_package_name(version_set_id);
-                self.add_clauses_for_package(&output, dependency_name)
-                    .await?;
-
-                // Find all the solvables that match for the given version set
-                let candidates = self
-                    .cache
-                    .get_or_cache_sorted_candidates(version_set_id)
-                    .await?;
-
-                // Queue requesting the dependencies of the candidates as well if they are cheaply
-                // available from the dependency provider.
-                let mut queue = queue.borrow_mut();
-                let mut seen = seen.borrow_mut();
-                for &candidate in candidates {
-                    if seen.insert(candidate)
-                        && self.cache.are_dependencies_available_for(candidate)
-                    {
-                        queue.push(candidate);
-                    }
-                }
-
-                // Add the requires clause
-                let no_candidates = candidates.is_empty();
-                let (clause, conflict) = ClauseState::requires(
-                    solvable_id,
-                    version_set_id,
-                    candidates,
-                    &self.decision_tracker,
-                );
-
-                let clause_id = self.clauses.borrow_mut().alloc(clause);
-                let clause = &self.clauses.borrow()[clause_id];
-
-                let &Clause::Requires(solvable_id, version_set_id) = &clause.kind else {
-                    unreachable!();
-                };
-
-                let mut output = output.borrow_mut();
-                if clause.has_watches() {
-                    output.clauses_to_watch.push(clause_id);
-                }
-
-                output
-                    .new_requires_clauses
-                    .push((solvable_id, version_set_id, clause_id));
-
-                if conflict {
-                    output.conflicting_clauses.push(clause_id);
-                } else if no_candidates {
-                    // Add assertions for unit clauses (i.e. those with no matching candidates)
-                    output.negative_assertions.push((solvable_id, clause_id));
-                }
-
-                Ok::<_, Box<dyn Any>>(())
-            });
-
-            let add_constrains = constrains.into_iter().map(|version_set_id| async move {
-                let dependency_name = self.pool.resolve_version_set_package_name(version_set_id);
-                self.add_clauses_for_package(&output, dependency_name)
-                    .await?;
-
-                // Find all the solvables that match for the given version set
-                let constrained_candidates = self
-                    .cache
-                    .get_or_cache_non_matching_candidates(version_set_id)
-                    .await?;
-
-                // Add forbidden clauses for the candidates
-                let mut output = output.borrow_mut();
-                for forbidden_candidate in constrained_candidates.iter().copied().collect_vec() {
-                    let (clause, conflict) = ClauseState::constrains(
-                        solvable_id,
-                        forbidden_candidate,
-                        version_set_id,
-                        &self.decision_tracker,
+                    let solvable = self.pool.resolve_internal_solvable(solvable_id);
+                    tracing::trace!(
+                        "┝━ adding clauses for dependencies of {}",
+                        solvable.display(&self.pool)
                     );
 
-                    let clause_id = self.clauses.borrow_mut().alloc(clause);
-                    output.clauses_to_watch.push(clause_id);
+                    // TODO: we can probably make this even more concurrent
 
-                    if conflict {
-                        output.conflicting_clauses.push(clause_id);
-                    }
+                    // Determine the dependencies of the current solvable. There are two cases here:
+                    // 1. The solvable is the root solvable which only provides required dependencies.
+                    // 2. The solvable is a package candidate in which case we request the corresponding
+                    //    dependencies from the `DependencyProvider`.
+                    match solvable.inner {
+                        SolvableInner::Root => {
+                            let _ = add_requirements_tx.send(self.root_requirements.clone());
+                        }
+                        SolvableInner::Package(_) => {
+                            let deps = match self.cache.get_or_cache_dependencies(solvable_id).await
+                            {
+                                Ok(deps) => deps,
+                                Err(cancelled) => {
+                                    *cancel_requested.borrow_mut() = Some(cancelled);
+                                    break;
+                                }
+                            };
+                            match deps {
+                                Dependencies::Known(deps) => {
+                                    // TODO: do we need error handling here?
+                                    let _ = add_requirements_tx.send(deps.requirements.clone());
+                                    let _ = add_constrains_tx.send(deps.constrains.clone());
+                                }
+                                Dependencies::Unknown(reason) => {
+                                    // There is no information about the solvable's dependencies, so we add
+                                    // an exclusion clause for it
+                                    let clause_id = self
+                                        .clauses
+                                        .borrow_mut()
+                                        .alloc(ClauseState::exclude(solvable_id, *reason));
+
+                                    // Exclusions are negative assertions, tracked outside of the watcher system
+                                    let mut output = output.borrow_mut();
+                                    output.negative_assertions.push((solvable_id, clause_id));
+
+                                    // There might be a conflict now
+                                    if self.decision_tracker.assigned_value(solvable_id)
+                                        == Some(true)
+                                    {
+                                        output.conflicting_clauses.push(clause_id);
+                                    }
+                                }
+                            }
+                        }
+                    };
                 }
 
-                Ok::<_, Box<dyn Any>>(())
-            });
+                println!("No more solvables to process");
+            };
 
-            let add_requirements = futures::future::join_all(add_requirements);
-            let add_constrains = futures::future::join_all(add_constrains);
-            let (results1, results2) =
-                futures::future::join(add_requirements, add_constrains).await;
-            for result in results1.into_iter().chain(results2) {
-                result?;
-            }
+            let add_requirements_stream = futures::stream::unfold(
+                add_requirements_rx,
+                |mut add_requirements_rx| async move {
+                    println!("Received requirement");
+                    add_requirements_rx
+                        .recv()
+                        .await
+                        .map(|requirements| (requirements, add_requirements_rx))
+                },
+            );
 
-            *clauses_added = true;
+            let solvable_queue_tx_cloned = solvable_queue_tx.clone();
+            let add_requirements =
+                add_requirements_stream.for_each_concurrent(None, move |requirements| {
+                    let solvable_queue_tx_cloned = solvable_queue_tx_cloned.clone();
+                    let solvable_queue_tx_repeated =
+                        std::iter::repeat_with(move || solvable_queue_tx_cloned.clone());
+                    async move {
+                        futures::future::join_all(
+                            requirements
+                                .into_iter()
+                                .zip(solvable_queue_tx_repeated)
+                                .map(|(version_set_id, solvable_queue_tx_cloned)| async move {
+                                    println!("Processing requirement");
+                                    let result = async move {
+                                        let dependency_name = self
+                                            .pool
+                                            .resolve_version_set_package_name(version_set_id);
+                                        self.add_clauses_for_package(output, dependency_name)
+                                            .await?;
+
+                                        // Find all the solvables that match for the given version set
+                                        let candidates = self
+                                            .cache
+                                            .get_or_cache_sorted_candidates(version_set_id)
+                                            .await?;
+
+                                        // Queue requesting the dependencies of the candidates as well if they are cheaply
+                                        // available from the dependency provider
+                                        for &candidate in candidates {
+                                            if self.cache.are_dependencies_available_for(candidate)
+                                            {
+                                                let _ = solvable_queue_tx_cloned.send(candidate);
+                                            }
+                                        }
+
+                                        // Add the requires clause
+                                        let no_candidates = candidates.is_empty();
+                                        let (clause, conflict) = ClauseState::requires(
+                                            solvable_id,
+                                            version_set_id,
+                                            candidates,
+                                            &self.decision_tracker,
+                                        );
+
+                                        let clause_id = self.clauses.borrow_mut().alloc(clause);
+                                        let clause = &self.clauses.borrow()[clause_id];
+
+                                        let &Clause::Requires(solvable_id, version_set_id) =
+                                            &clause.kind
+                                        else {
+                                            unreachable!();
+                                        };
+
+                                        let mut output = output.borrow_mut();
+                                        if clause.has_watches() {
+                                            output.clauses_to_watch.push(clause_id);
+                                        }
+
+                                        output.new_requires_clauses.push((
+                                            solvable_id,
+                                            version_set_id,
+                                            clause_id,
+                                        ));
+
+                                        if conflict {
+                                            output.conflicting_clauses.push(clause_id);
+                                        } else if no_candidates {
+                                            // Add assertions for unit clauses (i.e. those with no matching candidates)
+                                            output
+                                                .negative_assertions
+                                                .push((solvable_id, clause_id));
+                                        }
+
+                                        Ok::<_, Box<dyn Any>>(())
+                                    };
+
+                                    if let Err(cancelled) = result.await {
+                                        *cancel_requested.borrow_mut() = Some(cancelled);
+                                    }
+                                }),
+                        )
+                        .await;
+
+                        println!("Requirements processed for package");
+                    }
+                });
+
+            let add_constrains_stream =
+                futures::stream::unfold(add_constrains_rx, |mut add_constrains_rx| async move {
+                    println!("Received constrains");
+                    add_constrains_rx
+                        .recv()
+                        .await
+                        .map(|constrains| (constrains, add_constrains_rx))
+                });
+
+            let add_constrains =
+                add_constrains_stream.for_each_concurrent(None, |constrains| async move {
+                    futures::future::join_all(constrains.into_iter().map(
+                        |version_set_id| async move {
+                            println!("Processing constrains");
+                            let result = async move {
+                                let dependency_name =
+                                    self.pool.resolve_version_set_package_name(version_set_id);
+                                self.add_clauses_for_package(output, dependency_name)
+                                    .await?;
+
+                                // Find all the solvables that match for the given version set
+                                let constrained_candidates = self
+                                    .cache
+                                    .get_or_cache_non_matching_candidates(version_set_id)
+                                    .await?;
+
+                                // Add forbidden clauses for the candidates
+                                let mut output = output.borrow_mut();
+                                for forbidden_candidate in
+                                    constrained_candidates.iter().copied().collect_vec()
+                                {
+                                    let (clause, conflict) = ClauseState::constrains(
+                                        solvable_id,
+                                        forbidden_candidate,
+                                        version_set_id,
+                                        &self.decision_tracker,
+                                    );
+
+                                    let clause_id = self.clauses.borrow_mut().alloc(clause);
+                                    output.clauses_to_watch.push(clause_id);
+
+                                    if conflict {
+                                        output.conflicting_clauses.push(clause_id);
+                                    }
+                                }
+
+                                Ok::<_, Box<dyn Any>>(())
+                            };
+
+                            if let Err(cancelled) = result.await {
+                                *cancel_requested.borrow_mut() = Some(cancelled);
+                            }
+                        },
+                    ))
+                    .await;
+
+                    println!("Constrains processed for package");
+                });
+
+            drop(solvable_queue_tx); // Avoids deadlock
+            tokio::join!(process_queue, add_requirements, add_constrains);
+        }
+
+        if let Some(cancelled) = cancel_requested.into_inner() {
+            return Err(cancelled);
         }
 
         Ok(output.into_inner())
@@ -386,18 +462,12 @@ impl<VS: VersionSet, N: PackageName + Display, D: DependencyProvider<VS, N>> Sol
         output: &RefCell<AddClauseOutput>,
         package_name: NameId,
     ) -> Result<(), Box<dyn Any>> {
-        let mutex = {
-            let mut clauses = self.clauses_added_for_package.borrow_mut();
-            let mutex = clauses
-                .entry(package_name)
-                .or_insert_with(|| Rc::new(tokio::sync::Mutex::new(false)));
-            mutex.clone()
-        };
-
-        // This prevents concurrent calls to `add_clauses_for_package` from racing. Only the first
-        // call for a given package will go through, and others will wait till it completes.
-        let mut clauses_added = mutex.lock().await;
-        if *clauses_added {
+        let newly_inserted = self
+            .clauses_added_for_package
+            .borrow_mut()
+            .insert(package_name);
+        if !newly_inserted {
+            // The package has already been, or is being processed
             return Ok(());
         }
 
@@ -462,7 +532,6 @@ impl<VS: VersionSet, N: PackageName + Display, D: DependencyProvider<VS, N>> Sol
             debug_assert!(self.decision_tracker.assigned_value(solvable) != Some(true));
         }
 
-        *clauses_added = true;
         Ok(())
     }
 
@@ -570,7 +639,7 @@ impl<VS: VersionSet, N: PackageName + Display, D: DependencyProvider<VS, N>> Sol
                     !self
                         .clauses_added_for_solvable
                         .borrow()
-                        .contains_key(&d.solvable_id)
+                        .contains(&d.solvable_id)
                 })
                 .map(|d| (d.solvable_id, d.derived_from))
                 .collect();
